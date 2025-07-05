@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Text;
 using System.Windows.Controls;
+using System;
 
 namespace PoeFixer;
 
@@ -25,38 +26,78 @@ public class PatchManager
 
     public PatchManager(LibBundle3.Index index, MainWindow window)
     {
-        CachePath = $"{AppDomain.CurrentDomain.BaseDirectory}extractedassets/";
-        ModifiedCachePath = $"{AppDomain.CurrentDomain.BaseDirectory}modifiedassets/";
-
-        this.index = index;
-        this.window = window;
+        this.index = index ?? throw new ArgumentNullException(nameof(index));
+        this.window = window ?? throw new ArgumentNullException(nameof(window));
+        
+        CachePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "extractedassets", "");
+        ModifiedCachePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "modifiedassets", "");
     }
 
     public int RestoreExtractedAssets()
     {
-        if (File.Exists("patch.zip")) File.Delete("patch.zip");
-        ZipFile.CreateFromDirectory(CachePath, "patch.zip");
-        ZipArchive archive = ZipFile.OpenRead("patch.zip");
-        int count = LibBundle3.Index.Replace(index, archive.Entries);
-        archive.Dispose();
-        File.Delete("patch.zip");
-        return count;
+        try
+        {
+            if (!Directory.Exists(CachePath))
+            {
+                window.EmitToConsole($"Cache directory not found: {CachePath}");
+                return 0;
+            }
+
+            var patchZipPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "patch.zip");
+            
+            // Clean up existing patch file
+            if (File.Exists(patchZipPath))
+            {
+                File.Delete(patchZipPath);
+            }
+
+            // Create zip archive
+            ZipFile.CreateFromDirectory(CachePath, patchZipPath);
+            
+            using var archive = ZipFile.OpenRead(patchZipPath);
+            int count = LibBundle3.Index.Replace(index, archive.Entries);
+            
+            // Clean up patch file
+            if (File.Exists(patchZipPath))
+            {
+                File.Delete(patchZipPath);
+            }
+            
+            return count;
+        }
+        catch (Exception ex)
+        {
+            App.LogException(ex, "Error in RestoreExtractedAssets");
+            window.EmitToConsole($"Error restoring assets: {ex.Message}");
+            return 0;
+        }
     }
 
     public void CollectSettings()
     {
-        // Find every named checkbox in the window.
-        foreach (Control control in window.mainGrid.Children)
+        try
         {
-            if (control is CheckBox checkbox)
-            {
-                bools.Add(checkbox.Name, checkbox.IsChecked == true);
-            }
+            bools.Clear();
+            floats.Clear();
 
-            if (control is Slider slider)
+            // Find every named checkbox in the window.
+            foreach (Control control in window.mainGrid.Children)
             {
-                floats.Add(slider.Name, (float)slider.Value);
+                if (control is CheckBox checkbox && !string.IsNullOrEmpty(checkbox.Name))
+                {
+                    bools[checkbox.Name] = checkbox.IsChecked == true;
+                }
+
+                if (control is Slider slider && !string.IsNullOrEmpty(slider.Name))
+                {
+                    floats[slider.Name] = (float)slider.Value;
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            App.LogException(ex, "Error in CollectSettings");
+            window.EmitToConsole($"Error collecting settings: {ex.Message}");
         }
     }
 
@@ -65,121 +106,217 @@ public class PatchManager
     /// </summary>
     public int Patch()
     {
-        // Get every class implementing the IPatch interface.
-        Type[] patchTypes = Assembly.GetExecutingAssembly().GetTypes().Where(x => x.GetInterfaces().Contains(typeof(IPatch))).ToArray();
-
-        CollectSettings();
-
-        // Instantiate every patch, only keep enabled ones.
-        IPatch[] patches = new IPatch[patchTypes.Length];
-        for (int i = 0; i < patchTypes.Length; i++)
+        try
         {
-            patches[i] = (IPatch)Activator.CreateInstance(patchTypes[i])!;
-        }
-        patches = patches.Where(x => x.ShouldPatch(bools, floats)).ToArray();
+            // Get every class implementing the IPatch interface.
+            Type[] patchTypes = Assembly.GetExecutingAssembly().GetTypes()
+                .Where(x => x.GetInterfaces().Contains(typeof(IPatch)))
+                .ToArray();
 
-        // Delete modified file directory.
-        if (Directory.Exists(ModifiedCachePath))
-        {
-            Directory.Delete(ModifiedCachePath, true);
-        }
-        Directory.CreateDirectory(ModifiedCachePath);
-
-        // Modify files.
-        foreach (IPatch patch in patches)
-        {
-            Stopwatch stopWatch = new();
-            stopWatch.Start();
-
-            foreach (string file in patch.FilesToPatch)
+            if (patchTypes.Length == 0)
             {
-                TryModifyFile(file, patch);
+                window.EmitToConsole("No patch types found.");
+                return 0;
             }
 
-            foreach (string directory in patch.DirectoriesToPatch)
-            {
-                string[] extensions = patch.Extension.Split('|');
+            CollectSettings();
 
-                for (int i = 0; i < extensions.Length; i++)
+            // Instantiate every patch, only keep enabled ones.
+            List<IPatch> enabledPatches = new List<IPatch>();
+            
+            foreach (var patchType in patchTypes)
+            {
+                try
                 {
-                    ModifyDirectory(directory, extensions[i], patch);
+                    var patch = (IPatch)Activator.CreateInstance(patchType)!;
+                    if (patch.ShouldPatch(bools, floats))
+                    {
+                        enabledPatches.Add(patch);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    App.LogException(ex, $"Error creating patch instance: {patchType.Name}");
+                    window.EmitToConsole($"Error creating patch {patchType.Name}: {ex.Message}");
                 }
             }
 
-            stopWatch.Stop();
-            window.EmitToConsole($"{patch.GetType().Name} patched in {(int)stopWatch.Elapsed.TotalMilliseconds}ms.");
-        }
+            if (enabledPatches.Count == 0)
+            {
+                window.EmitToConsole("No patches enabled.");
+                return 0;
+            }
 
-        if (File.Exists("patch.zip")) File.Delete("patch.zip");
-        ZipFile.CreateFromDirectory(ModifiedCachePath, "patch.zip");
-        ZipArchive archive = ZipFile.OpenRead("patch.zip");
-        int count = LibBundle3.Index.Replace(index, archive.Entries);
-        archive.Dispose();
-        //File.Delete("patch.zip");
-        return count;
+            // Ensure cache directory exists
+            if (!Directory.Exists(CachePath))
+            {
+                window.EmitToConsole($"Cache directory not found: {CachePath}");
+                return 0;
+            }
+
+            // Delete and recreate modified file directory.
+            if (Directory.Exists(ModifiedCachePath))
+            {
+                Directory.Delete(ModifiedCachePath, true);
+            }
+            Directory.CreateDirectory(ModifiedCachePath);
+
+            // Modify files.
+            foreach (IPatch patch in enabledPatches)
+            {
+                try
+                {
+                    Stopwatch stopWatch = Stopwatch.StartNew();
+
+                    foreach (string file in patch.FilesToPatch)
+                    {
+                        TryModifyFile(file, patch);
+                    }
+
+                    foreach (string directory in patch.DirectoriesToPatch)
+                    {
+                        string[] extensions = patch.Extension.Split('|');
+
+                        foreach (string extension in extensions)
+                        {
+                            if (!string.IsNullOrEmpty(extension))
+                            {
+                                ModifyDirectory(directory, extension, patch);
+                            }
+                        }
+                    }
+
+                    stopWatch.Stop();
+                    window.EmitToConsole($"{patch.GetType().Name} patched in {(int)stopWatch.Elapsed.TotalMilliseconds}ms.");
+                }
+                catch (Exception ex)
+                {
+                    App.LogException(ex, $"Error applying patch: {patch.GetType().Name}");
+                    window.EmitToConsole($"Error applying patch {patch.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            // Create final patch zip
+            var patchZipPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "patch.zip");
+            
+            if (File.Exists(patchZipPath))
+            {
+                File.Delete(patchZipPath);
+            }
+
+            if (!Directory.Exists(ModifiedCachePath) || !Directory.EnumerateFileSystemEntries(ModifiedCachePath).Any())
+            {
+                window.EmitToConsole("No modified assets to apply.");
+                return 0;
+            }
+
+            ZipFile.CreateFromDirectory(ModifiedCachePath, patchZipPath);
+            
+            using var archive = ZipFile.OpenRead(patchZipPath);
+            int count = LibBundle3.Index.Replace(index, archive.Entries);
+            
+            // Keep patch.zip for debugging - don't delete it
+            return count;
+        }
+        catch (Exception ex)
+        {
+            App.LogException(ex, "Error in Patch");
+            window.EmitToConsole($"Error applying patches: {ex.Message}");
+            return 0;
+        }
     }
 
     public void ModifyDirectory(string path, string extension, IPatch patch)
     {
-        IEnumerable<string> files = Directory.EnumerateFiles($"{CachePath}{path}", extension, SearchOption.AllDirectories);
-
-        foreach (string file in files)
+        try
         {
-            ModifyFile(file, patch);
+            var searchPath = Path.Combine(CachePath, path);
+            
+            if (!Directory.Exists(searchPath))
+            {
+                window.EmitToConsole($"Directory not found: {searchPath}");
+                return;
+            }
+
+            IEnumerable<string> files = Directory.EnumerateFiles(searchPath, extension, SearchOption.AllDirectories);
+
+            foreach (string file in files)
+            {
+                ModifyFile(file, patch);
+            }
+        }
+        catch (Exception ex)
+        {
+            App.LogException(ex, $"Error in ModifyDirectory: {path}");
+            window.EmitToConsole($"Error modifying directory {path}: {ex.Message}");
         }
     }
 
     public void TryModifyFile(string path, IPatch patch)
     {
-        path = $"{CachePath}{path}";
-        if (File.Exists(path))
+        try
         {
-            ModifyFile(path, patch);
+            var fullPath = Path.Combine(CachePath, path);
+            if (File.Exists(fullPath))
+            {
+                ModifyFile(fullPath, patch);
+            }
+            else
+            {
+                window.EmitToConsole($"File not found: {fullPath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            App.LogException(ex, $"Error in TryModifyFile: {path}");
+            window.EmitToConsole($"Error trying to modify file {path}: {ex.Message}");
         }
     }
 
     public void ModifyFile(string path, IPatch patch)
     {
-        bool patchModifiedAsset = patchedFiles.Contains(path);
-
-        // Grab this file from the modified cache if it was modified already.
-        if (patchModifiedAsset) path = path.Replace(CachePath, ModifiedCachePath);
-
-        string text = File.ReadAllText(path);
-
-        string? modifiedText = patch.PatchFile(text);
-        if (modifiedText == null) return;
-
-        // Write to the modifie d cache.
-        if (patchModifiedAsset)
+        try
         {
-            // Check if extension is glsl.
-            if (Path.GetExtension(path) == ".hlsl")
+            if (!File.Exists(path))
             {
-                File.WriteAllText(path, modifiedText, Encoding.ASCII);
+                window.EmitToConsole($"File not found: {path}");
+                return;
             }
-            else
+
+            bool patchModifiedAsset = patchedFiles.Contains(path);
+
+            // Grab this file from the modified cache if it was modified already.
+            string currentPath = patchModifiedAsset ? path.Replace(CachePath, ModifiedCachePath) : path;
+
+            string text = File.ReadAllText(currentPath);
+
+            string? modifiedText = patch.PatchFile(text);
+            if (modifiedText == null) return;
+
+            // Determine output path
+            string outputPath = patchModifiedAsset ? currentPath : path.Replace(CachePath, ModifiedCachePath);
+
+            // Ensure output directory exists
+            var outputDir = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
             {
-                File.WriteAllText(path, modifiedText, Encoding.Unicode);
+                Directory.CreateDirectory(outputDir);
+            }
+
+            // Choose encoding based on file extension
+            Encoding encoding = Path.GetExtension(outputPath).ToLower() == ".hlsl" ? Encoding.ASCII : Encoding.Unicode;
+            
+            File.WriteAllText(outputPath, modifiedText, encoding);
+
+            if (!patchModifiedAsset)
+            {
+                patchedFiles.Add(path);
             }
         }
-        else
+        catch (Exception ex)
         {
-            string modifiedPath = path.Replace(CachePath, ModifiedCachePath);
-
-            // Ensure path exists.
-            Directory.CreateDirectory(Path.GetDirectoryName(modifiedPath)!);
-
-            if (Path.GetExtension(modifiedPath) == ".hlsl")
-            {
-                File.WriteAllText(modifiedPath, modifiedText, Encoding.ASCII);
-            }
-            else
-            {
-                File.WriteAllText(modifiedPath, modifiedText, Encoding.Unicode);
-            }
-
-            patchedFiles.Add(path);
+            App.LogException(ex, $"Error in ModifyFile: {path}");
+            window.EmitToConsole($"Error modifying file {path}: {ex.Message}");
         }
     }
 }
